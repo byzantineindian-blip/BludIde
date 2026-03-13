@@ -7,5 +7,6 @@ data class DownloadStatus(
     val totalBytes: Long = 0,
     val speed: String = "0 KB/s",
     val isCompleted: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val terminalLogs: List<String> = emptyList()
 )
