@@ -1,7 +1,11 @@
 package com.bludosmodding.ui.screens
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
@@ -19,6 +23,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -33,20 +38,36 @@ fun OnboardingScreen(
     onDownloadComplete: () -> Unit,
     viewModel: DownloadViewModel = viewModel()
 ) {
+    val context = LocalContext.current
     val downloadStatus by viewModel.downloadStatus.collectAsState()
     
-    var showPermissionUI by remember { mutableStateOf(true) }
+    var storagePermissionGranted by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                // Simplified for this demo, usually check READ/WRITE_EXTERNAL_STORAGE
+                true 
+            }
+        )
+    }
+
+    var notificationsPermissionGranted by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                false 
+            } else {
+                true
+            }
+        )
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val notificationsGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions[Manifest.permission.POST_NOTIFICATIONS] == true
-        } else true
-        
-        if (notificationsGranted) {
-            showPermissionUI = false
-            viewModel.startDownload()
+        notificationsPermissionGranted = permissions[Manifest.permission.POST_NOTIFICATIONS] == true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+             storagePermissionGranted = permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
         }
     }
 
@@ -90,7 +111,7 @@ fun OnboardingScreen(
             )
             
             Text(
-                text = "Environment Setup",
+                text = "Professional Toolchain Setup",
                 fontSize = 18.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
@@ -98,31 +119,64 @@ fun OnboardingScreen(
 
             Spacer(modifier = Modifier.height(32.dp))
 
-            if (showPermissionUI) {
-                PermissionRequestContent {
-                    val permissions = mutableListOf<String>()
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            val allPermissionsGranted = notificationsPermissionGranted && storagePermissionGranted
+
+            if (!allPermissionsGranted) {
+                PermissionRequestContent(
+                    storageGranted = storagePermissionGranted,
+                    notificationsGranted = notificationsPermissionGranted,
+                    onRequestNotifications = {
+                        val perms = mutableListOf<String>()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                            perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        }
+                        permissionLauncher.launch(perms.toTypedArray())
+                    },
+                    onRequestStorage = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                            intent.data = Uri.parse("package:\${context.packageName}")
+                            context.startActivity(intent)
+                        }
+                    },
+                    onStartDownload = {
+                        viewModel.startDownload()
                     }
-                    permissionLauncher.launch(permissions.toTypedArray())
-                }
+                )
             } else {
                 DownloadProgressContent(downloadStatus)
                 
                 Spacer(modifier = Modifier.height(24.dp))
                 
-                // Real-time Terminal Logs
                 TerminalLogView(
                     logs = downloadStatus.terminalLogs,
                     modifier = Modifier.weight(1f)
                 )
+
+                if (!downloadStatus.isDownloading && !downloadStatus.isCompleted && downloadStatus.error == null) {
+                    Button(
+                        onClick = { viewModel.startDownload() },
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
+                    ) {
+                        Text("Start Toolchain Setup")
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun PermissionRequestContent(onRequestPermissions: () -> Unit) {
+fun PermissionRequestContent(
+    storageGranted: Boolean,
+    notificationsGranted: Boolean,
+    onRequestNotifications: () -> Unit,
+    onRequestStorage: () -> Unit,
+    onStartDownload: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -133,23 +187,43 @@ fun PermissionRequestContent(onRequestPermissions: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "Permissions Required",
+                text = "Setup Requirements",
                 fontSize = 20.sp,
                 fontWeight = FontWeight.SemiBold
             )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "BludIDE needs notification permissions to keep the setup running in the background.",
-                textAlign = TextAlign.Center,
-                fontSize = 14.sp
-            )
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            PermissionItem("Notifications", notificationsGranted, onRequestNotifications)
+            Spacer(modifier = Modifier.height(8.dp))
+            PermissionItem("All Files Access", storageGranted, onRequestStorage)
+            
             Spacer(modifier = Modifier.height(24.dp))
+            
             Button(
-                onClick = onRequestPermissions,
+                onClick = onStartDownload,
+                enabled = storageGranted && notificationsGranted,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text("Grant Permissions & Start Setup")
+                Text("Start Toolchain Download")
+            }
+        }
+    }
+}
+
+@Composable
+fun PermissionItem(name: String, granted: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(name, fontSize = 16.sp)
+        if (granted) {
+            Text("Granted", color = Color.Green, fontWeight = FontWeight.Bold)
+        } else {
+            Button(onClick = onClick, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
+                Text("Grant", fontSize = 12.sp)
             }
         }
     }
@@ -184,7 +258,7 @@ fun DownloadProgressContent(status: DownloadStatus) {
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "${(status.progress * 100).toInt()}%",
+                text = "\${(status.progress * 100).toInt()}%",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -192,7 +266,7 @@ fun DownloadProgressContent(status: DownloadStatus) {
         
         if (status.error != null) {
             Text(
-                text = "Error: ${status.error}",
+                text = "Error: \${status.error}",
                 color = MaterialTheme.colorScheme.error,
                 fontSize = 14.sp,
                 modifier = Modifier.padding(top = 8.dp),
@@ -228,7 +302,7 @@ fun TerminalLogView(
         ) {
             item {
                 Text(
-                    text = "--- SYSTEM LOGS ---",
+                    text = "--- TOOLCHAIN LOGS ---",
                     color = Color.Cyan,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,

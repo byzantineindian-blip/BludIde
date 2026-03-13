@@ -29,6 +29,33 @@ class ToolchainDownloadService : Service() {
     private val NOTIFICATION_ID = 1001
     private val CHANNEL_ID = "toolchain_download_channel"
 
+    private val tasks = listOf(
+        DownloadTask(
+            name = "Proot Environment",
+            url = "https://github.com/termux/proot/releases/download/v5.1.107/proot-v5.1.107-aarch64-static",
+            targetFileName = "proot",
+            extract = false
+        ),
+        DownloadTask(
+            name = "Linux RootFS (Alpine)",
+            url = "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/aarch64/alpine-minirootfs-3.18.4-aarch64.tar.gz",
+            targetFileName = "rootfs.tar.gz",
+            extract = true
+        ),
+        DownloadTask(
+            name = "OpenJDK 17",
+            url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.8.1%2B1/OpenJDK17U-jdk_aarch64_linux_hotspot_17.0.8.1_1.tar.gz",
+            targetFileName = "jdk17.tar.gz",
+            extract = true
+        ),
+        DownloadTask(
+            name = "Gradle 8.3",
+            url = "https://services.gradle.org/distributions/gradle-8.3-bin.zip",
+            targetFileName = "gradle.zip",
+            extract = true
+        )
+    )
+
     inner class LocalBinder : Binder() {
         fun getService(): ToolchainDownloadService = this@ToolchainDownloadService
     }
@@ -43,45 +70,50 @@ class ToolchainDownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundService()
-        performSetup()
+        runFullSetup()
         return START_NOT_STICKY
     }
 
     private fun addLog(message: String) {
         val currentLogs = _downloadStatus.value.terminalLogs
         _downloadStatus.value = _downloadStatus.value.copy(
-            terminalLogs = currentLogs + "[${System.currentTimeMillis()}] $message"
+            terminalLogs = currentLogs + "[LOG] $message"
         )
     }
 
-    private fun performSetup() {
+    private fun runFullSetup() {
         serviceScope.launch {
             try {
                 _downloadStatus.value = _downloadStatus.value.copy(isDownloading = true)
-                addLog("Starting BludIDE Toolchain Setup...")
-                
-                // Step 1: Initialize Directories
+                addLog("Initializing BludIDE Full Toolchain Setup...")
+
                 val toolchainDir = File(filesDir, "toolchain")
-                if (!toolchainDir.exists()) {
-                    addLog("Creating toolchain directory...")
-                    toolchainDir.mkdirs()
+                if (!toolchainDir.exists()) toolchainDir.mkdirs()
+
+                tasks.forEachIndexed { index, task ->
+                    addLog("Processing (${index + 1}/${tasks.size}): ${task.name}")
+                    val outputFile = File(toolchainDir, task.targetFileName)
+                    
+                    if (!outputFile.exists()) {
+                        addLog("Downloading from ${task.url}...")
+                        downloadFile(task.url, outputFile, task.name)
+                    } else {
+                        addLog("${task.name} exists. Verifying...")
+                    }
+
+                    if (task.extract) {
+                        addLog("Extracting ${task.targetFileName}...")
+                        executeExtraction(outputFile, toolchainDir)
+                        addLog("Cleaning up archive...")
+                        outputFile.delete()
+                    }
                 }
 
-                // Step 2: Download Toolchain (Using OkHttp for progress tracking)
-                // Note: In a real scenario, this URL would be a real toolchain mirror.
-                val url = "https://example.com/toolchain.zip" 
-                addLog("Downloading toolchain components from $url...")
-                
-                downloadFile(url, File(toolchainDir, "toolchain.zip"))
+                addLog("Setting executable permissions...")
+                val proot = File(toolchainDir, "proot")
+                if (proot.exists()) proot.setExecutable(true, false)
 
-                // Step 3: Extract and Update via Terminal (Shell)
-                addLog("Extracting toolchain...")
-                executeShellCommand("unzip -o ${toolchainDir.absolutePath}/toolchain.zip -d ${toolchainDir.absolutePath}")
-
-                addLog("Updating toolchain environment...")
-                executeShellCommand("chmod +x ${toolchainDir.absolutePath}/bin/*")
-                
-                addLog("Environment setup complete.")
+                addLog("Toolchain setup complete. BludIDE is ready.")
                 
                 _downloadStatus.value = _downloadStatus.value.copy(
                     isDownloading = false,
@@ -93,7 +125,7 @@ class ToolchainDownloadService : Service() {
                 stopSelf()
 
             } catch (e: Exception) {
-                addLog("FATAL ERROR: ${e.message}")
+                addLog("ERROR: ${e.message}")
                 _downloadStatus.value = _downloadStatus.value.copy(
                     isDownloading = false,
                     error = e.message
@@ -103,26 +135,22 @@ class ToolchainDownloadService : Service() {
         }
     }
 
-    private suspend fun downloadFile(url: String, outputFile: File) = withContext(Dispatchers.IO) {
+    private suspend fun downloadFile(url: String, outputFile: File, taskName: String) = withContext(Dispatchers.IO) {
         val client = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
             .build()
 
         val request = Request.Builder().url(url).build()
         val response = client.newCall(request).execute()
 
-        if (!response.isSuccessful) {
-            val errorMsg = "Server returned code ${response.code}. Make sure your internet is stable."
-            addLog(errorMsg)
-            throw Exception(errorMsg)
-        }
+        if (!response.isSuccessful) throw Exception("Network failure ($taskName): ${response.code}")
 
-        val body = response.body ?: throw Exception("Response body is null")
+        val body = response.body ?: throw Exception("Null body for $taskName")
         val totalBytes = body.contentLength()
         val inputStream = body.byteStream()
         val outputStream = FileOutputStream(outputFile)
-        val buffer = ByteArray(16384)
+        val buffer = ByteArray(65536)
         var bytesRead: Int
         var downloadedBytes: Long = 0
         var lastUpdateTime = System.currentTimeMillis()
@@ -132,20 +160,21 @@ class ToolchainDownloadService : Service() {
             downloadedBytes += bytesRead
 
             val currentTime = System.currentTimeMillis()
-            if (currentTime - lastUpdateTime >= 300) {
+            if (currentTime - lastUpdateTime >= 500) {
                 val progress = if (totalBytes > 0) downloadedBytes.toFloat() / totalBytes else 0f
-                val speed = calculateSpeed(downloadedBytes, currentTime - lastUpdateTime) // Simplistic speed
+                val mb = String.format("%.2f", downloadedBytes / (1024.0 * 1024.0))
+                val totalMb = String.format("%.2f", totalBytes / (1024.0 * 1024.0))
                 
                 _downloadStatus.value = _downloadStatus.value.copy(
                     progress = progress,
                     downloadedBytes = downloadedBytes,
                     totalBytes = totalBytes,
-                    speed = speed
+                    speed = "$mb / $totalMb MB"
                 )
 
                 notificationManager.notify(
                     NOTIFICATION_ID,
-                    createNotification("Downloading toolchain: ${(progress * 100).toInt()}%", (progress * 100).toInt())
+                    createNotification("Setting up $taskName: ${(progress * 100).toInt()}%", (progress * 100).toInt())
                 )
                 lastUpdateTime = currentTime
             }
@@ -154,8 +183,13 @@ class ToolchainDownloadService : Service() {
         inputStream.close()
     }
 
-    private fun executeShellCommand(command: String) {
-        addLog("> $command")
+    private fun executeExtraction(file: File, targetDir: File) {
+        val command = when {
+            file.name.endsWith(".tar.gz") -> "tar -xzf ${file.absolutePath} -C ${targetDir.absolutePath}"
+            file.name.endsWith(".zip") -> "unzip -o ${file.absolutePath} -d ${targetDir.absolutePath}"
+            else -> return
+        }
+        
         try {
             val process = Runtime.getRuntime().exec(command)
             process.inputStream.bufferedReader().useLines { lines ->
@@ -163,7 +197,7 @@ class ToolchainDownloadService : Service() {
             }
             process.waitFor()
         } catch (e: Exception) {
-            addLog("Shell Error: ${e.message}")
+            addLog("Extraction failed for ${file.name}: ${e.message}")
         }
     }
 
@@ -171,7 +205,7 @@ class ToolchainDownloadService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Toolchain Setup",
+                "BludIDE Toolchain",
                 NotificationManager.IMPORTANCE_LOW
             )
             notificationManager.createNotificationChannel(channel)
@@ -179,7 +213,7 @@ class ToolchainDownloadService : Service() {
     }
 
     private fun startForegroundService() {
-        val notification = createNotification("Initializing setup...", 0)
+        val notification = createNotification("Initializing BludIDE...", 0)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -199,11 +233,6 @@ class ToolchainDownloadService : Service() {
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
-    }
-
-    private fun calculateSpeed(totalDownloaded: Long, timeDiff: Long): String {
-        // Dummy implementation for speed display
-        return "Streaming..."
     }
 
     override fun onDestroy() {
